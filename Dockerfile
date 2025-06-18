@@ -29,7 +29,7 @@ RUN if [ ! -f $CACHITO_ENV_FILE ]; then go mod download ; fi
 RUN if [ -f $CACHITO_ENV_FILE ] ; then source $CACHITO_ENV_FILE ; fi ; env ${GO_BUILD_EXTRA_ENV_ARGS} go build ${GO_BUILD_EXTRA_ARGS} -a -o ${DEST_ROOT}/manager main.go
 
 
-RUN cp -r templates ${DEST_ROOT}/templates
+RUN cp -r templates ${DEST_ROOT}/templates; chown -R 65532 ${DEST_ROOT}/templates
 
 # Use distroless as minimal base image to package the manager binary
 # Refer to https://github.com/GoogleContainerTools/distroless for more details
