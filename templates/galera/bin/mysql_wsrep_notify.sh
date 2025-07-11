@@ -53,6 +53,10 @@ function mysql_get_members {
 # When optional script parameters are not provided, set up the environment
 # variables with the latest WSREP state retrieved from mysql
 function mysql_probe_state {
+    # Store original MEMBERS for comparison during reprobe (before clearing)
+    local original_members=""
+    [ "$1" = "reprobe" ] && original_members="$MEMBERS"
+
     [ "$1" = "reprobe" ] && unset UUID PARTITION INDEX SIZE MEMBERS
     [ "$1" = "reprobe" ] && log "DEBUG: Reprobing mysql state - clearing old values"
     : ${UUID=$(mysql_get_status wsrep_gcomm_uuid)}
@@ -60,6 +64,21 @@ function mysql_probe_state {
     : ${INDEX=$(mysql_get_status wsrep_local_index)}
     : ${SIZE=$(mysql_get_status wsrep_cluster_size)}
     : ${MEMBERS=$(mysql_get_members)}
+
+    # Check for inconsistency between cluster size and member count
+    local member_count=$(echo "$MEMBERS" | wc -l)
+    if [ "$SIZE" != "$member_count" ]; then
+        log "WARNING: Cluster size ($SIZE) != member count ($member_count). Membership table may contain stale data."
+        log "WARNING: Cluster size: $SIZE, Members found: $member_count"
+        log "WARNING: Members list: $MEMBERS"
+        # During reprobe, preserve original authoritative members if size doesn't match
+        if [ "$1" = "reprobe" -a -n "$original_members" ]; then
+            log "WARNING: Reprobe detected stale membership data. Preserving original cluster state from Galera."
+            MEMBERS="$original_members"
+            log "WARNING: Using original MEMBERS: $MEMBERS"
+        fi
+    fi
+
     log "DEBUG: mysql_probe_state - MEMBERS='${MEMBERS}', SIZE='${SIZE}', INDEX='${INDEX}', PARTITION='${PARTITION}'"
     [ -n "${UUID}" -a -n "${PARTITION}" -a -n "${INDEX}" -a -n "${SIZE}" -a -n "${MEMBERS}" ]
 }
