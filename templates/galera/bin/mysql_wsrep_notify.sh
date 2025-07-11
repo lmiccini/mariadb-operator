@@ -42,20 +42,25 @@ function mysql_get_status {
 }
 
 function mysql_get_members {
-    mysql -nN -uroot -p"${DB_ROOT_PASSWORD}" -e "select node_name from mysql.wsrep_cluster_members;"
+    local members_result
+    members_result=$(mysql -nN -uroot -p"${DB_ROOT_PASSWORD}" -e "select node_name from mysql.wsrep_cluster_members;")
     local rc=$?
+    log "DEBUG: mysql_get_members query result: '${members_result}' (rc=${rc})"
     [ $rc = 0 ] || log_error "could not get cluster members from mysql' (rc=$rc)"
+    echo "${members_result}"
 }
 
 # When optional script parameters are not provided, set up the environment
 # variables with the latest WSREP state retrieved from mysql
 function mysql_probe_state {
     [ "$1" = "reprobe" ] && unset UUID PARTITION INDEX SIZE MEMBERS
+    [ "$1" = "reprobe" ] && log "DEBUG: Reprobing mysql state - clearing old values"
     : ${UUID=$(mysql_get_status wsrep_gcomm_uuid)}
     : ${PARTITION=$(mysql_get_status wsrep_cluster_status)}
     : ${INDEX=$(mysql_get_status wsrep_local_index)}
     : ${SIZE=$(mysql_get_status wsrep_cluster_size)}
     : ${MEMBERS=$(mysql_get_members)}
+    log "DEBUG: mysql_probe_state - MEMBERS='${MEMBERS}', SIZE='${SIZE}', INDEX='${INDEX}', PARTITION='${PARTITION}'"
     [ -n "${UUID}" -a -n "${PARTITION}" -a -n "${INDEX}" -a -n "${SIZE}" -a -n "${MEMBERS}" ]
 }
 
@@ -118,8 +123,10 @@ function retry {
     local wait=$WSREP_NOTIFY_RETRY_WAIT
     local rc=1
 
+    log "DEBUG: Starting retry loop for action='${action}', retries=${retries}"
     $action
     rc=$?
+    log "DEBUG: Initial action result: rc=${rc}"
     while [ $rc -ne 0 -a $retries -gt 0 ]; do
         # if API call are unauthorized, the resource is being deleted
         # exit now as there is nothing more to do
@@ -131,14 +138,17 @@ function retry {
         sleep $wait
         $action
         rc=$?
+        log "DEBUG: Retry action result: rc=${rc}, retries_left=${retries}"
         retries=$((retries - 1))
         # reprobe mysql state now, as if the cluster state changed since
         # the start of this script, we might not need to retry the action
+        log "DEBUG: Calling mysql_probe_state reprobe"
         mysql_probe_state reprobe
     done
     if [ $rc -ne 0 ]; then
         log_error "Could not run action after ${WSREP_NOTIFY_RETRIES} tries. Stop retrying."
     fi
+    log "DEBUG: Retry loop finished: rc=${rc}"
     return $rc
 }
 
@@ -149,6 +159,7 @@ function retry {
 
 ## Change the current Active endpoint in a service
 function reconfigure_service_endpoint {
+    log "DEBUG: reconfigure_service_endpoint called - MEMBERS='${MEMBERS}', PODNAME='${PODNAME}', PARTITION='${PARTITION}', INDEX='${INDEX}'"
     if [ $PARTITION != "Primary" -o "$INDEX" != "0" ]; then
         log "Node ${PODNAME} is not the first member of a Primary partion (index: ${INDEX}). Exiting"
         return 0
@@ -160,6 +171,8 @@ function reconfigure_service_endpoint {
 
     CURRENT_ENDPOINT=$(echo "$CURRENT_SVC" | parse_output '["spec"]["selector"].get("statefulset.kubernetes.io/pod-name","")')
     [ $? == 0 ] || return 1
+    log "DEBUG: Current endpoint from service: '${CURRENT_ENDPOINT}'"
+    log "DEBUG: Checking if '${CURRENT_ENDPOINT}' is in MEMBERS list: '${MEMBERS}'"
     # do not reconfigure endpoint if unecessary, to avoid client disconnections
     if [ -n "${CURRENT_ENDPOINT}" ] && echo "$MEMBERS" | grep -q "^${CURRENT_ENDPOINT}\$"; then
         log "Active endpoint ${CURRENT_ENDPOINT} is still part of the primary partition. Nothing to be done."
@@ -257,6 +270,7 @@ while [ $# -gt 0 ]; do
         --members)
             MEMBERS=$(echo "$2" | tr ',' '\n' | cut -d/ -f2)
             SIZE=$(echo "$MEMBERS" | wc -l)
+            log "DEBUG: Initial MEMBERS from command line: '${MEMBERS}', SIZE='${SIZE}'"
             shift;;
         --primary)
             [ "$2" = "yes" ] && PARTITION="Primary"
@@ -303,7 +317,9 @@ if [ $? != 0 ]; then
 fi
 
 # Condition: first member of the primary partition -> set as Active endpoint
+log "DEBUG: Final condition check - PARTITION='${PARTITION}', SIZE='${SIZE}', INDEX='${INDEX}'"
 if [ $PARTITION = "Primary" -a $SIZE -ge 0 -a "$INDEX" = "0" ]; then
+    log "DEBUG: Condition met - calling reconfigure_service_endpoint"
     retry "reconfigure_service_endpoint"
     exit $?
 fi
