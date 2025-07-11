@@ -66,7 +66,11 @@ function api_server {
         request="$request -d @-"
     fi
     local output
-    output=$(curl --connect-timeout 5 --max-time 30 -s --cacert ${CACERT} --header "Content-Type:application/json" --header "Authorization: Bearer ${TOKEN}" --request $request ${APISERVER}/api/v1/namespaces/${NAMESPACE}/services/${service})
+
+    for i in 1 2 3 4 5;
+    do
+	 output=$(curl --connect-timeout 5 --max-time 30 -s --cacert ${CACERT} --header "Content-Type:application/json" --header "Authorization: Bearer ${TOKEN}" --request $request ${APISERVER}/api/v1/namespaces/${NAMESPACE}/services/${service}) && break || sleep 10;
+    done
 
     local rc=$?
     if [ $rc != 0 ]; then
