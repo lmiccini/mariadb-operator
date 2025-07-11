@@ -136,14 +136,14 @@ function retry {
         fi
         log_error "previous action failed, retrying."
         sleep $wait
+        # reprobe mysql state now, as if the cluster state changed since
+        # the start of this script, we might not need to retry the action
+        log "DEBUG: Calling mysql_probe_state reprobe before retry"
+        mysql_probe_state reprobe
         $action
         rc=$?
         log "DEBUG: Retry action result: rc=${rc}, retries_left=${retries}"
         retries=$((retries - 1))
-        # reprobe mysql state now, as if the cluster state changed since
-        # the start of this script, we might not need to retry the action
-        log "DEBUG: Calling mysql_probe_state reprobe"
-        mysql_probe_state reprobe
     done
     if [ $rc -ne 0 ]; then
         log_error "Could not run action after ${WSREP_NOTIFY_RETRIES} tries. Stop retrying."
