@@ -292,6 +292,21 @@ func clearPodAttributes(instance *mariadbv1.Galera, podName string) {
 	}
 }
 
+// clearPodRuntimeState clears only the runtime state (Gcomm, ContainerID) but preserves
+// the persistent data (Seqno, UUID, SafeToBootstrap) when a pod fails and restarts.
+// This prevents data loss by ensuring we don't forget which pod has the most recent data.
+func clearPodRuntimeState(instance *mariadbv1.Galera, podName string) {
+	attr, found := instance.Status.Attributes[podName]
+	if !found {
+		return
+	}
+	// Clear only ephemeral runtime state
+	attr.Gcomm = ""
+	attr.ContainerID = ""
+	// Preserve persistent data: UUID, Seqno, SafeToBootstrap, NoGrastate
+	instance.Status.Attributes[podName] = attr
+}
+
 // clearOldPodsAttributesOnScaleDown removes known information from old pods
 // that no longer exist after a scale down of the galera CR
 func clearOldPodsAttributesOnScaleDown(ctx context.Context, instance *mariadbv1.Galera) {
@@ -311,7 +326,8 @@ func clearOldPodsAttributesOnScaleDown(ctx context.Context, instance *mariadbv1.
 
 // assertPodsAttributesValidity compares the current state of the pods that are starting galera
 // against their known state in the CR's attributes. If a pod's attributes don't match its actual
-// state (i.e. it failed to start galera), the attributes are cleared from the CR's status
+// state (i.e. it failed to start galera), only the runtime state is cleared to allow retry while
+// preserving the seqno information to prevent data loss.
 func assertPodsAttributesValidity(helper *helper.Helper, instance *mariadbv1.Galera, pods []corev1.Pod) {
 	for _, pod := range pods {
 		_, found := instance.Status.Attributes[pod.Name]
@@ -325,10 +341,10 @@ func assertPodsAttributesValidity(helper *helper.Helper, instance *mariadbv1.Gal
 		if !containerFound || (attrCID != "" && attrCID != podCID) {
 			// This gcomm URI was pushed in a pod which was restarted
 			// before the attribute got cleared, which means the pod
-			// failed to start galera. Clear the attribute here, and
-			// reprobe the pod's state in the next reconcile loop
-			clearPodAttributes(instance, pod.Name)
-			util.LogForObject(helper, "Pod restarted while galera was starting", instance, "pod", pod.Name, "recorded ID", attrCID)
+			// failed to start galera. Clear only the runtime state (Gcomm, ContainerID)
+			// but preserve the seqno to prevent data loss.
+			clearPodRuntimeState(instance, pod.Name)
+			util.LogForObject(helper, "Pod restarted while galera was starting, clearing runtime state", instance, "pod", pod.Name, "recorded ID", attrCID)
 		}
 	}
 }
@@ -858,8 +874,8 @@ func (r *GaleraReconciler) Reconcile(ctx context.Context, req ctrl.Request) (res
 			if err != nil {
 				log.Error(err, "Failed to push gcomm URI", "pod", name)
 				// A failed injection likely means the pod's status has changed.
-				// drop it from status and reprobe it in another reconcile loop
-				clearPodAttributes(instance, name)
+				// Clear runtime state but preserve seqno to prevent data loss on retry
+				clearPodRuntimeState(instance, name)
 				return ctrl.Result{}, err
 			}
 		}
@@ -905,15 +921,20 @@ func (r *GaleraReconciler) Reconcile(ctx context.Context, req ctrl.Request) (res
 		}
 		if found {
 			pod := getPodFromName(podList.Items, node)
-			log.Info("Pushing gcomm URI to bootstrap", "pod", node)
-			// Setting the gcomm attribute marks this pod as 'currently bootstrapping the cluster'
-			err := injectGcommURI(ctx, helper, r.config, instance, pod, "gcomm://")
-			if err != nil {
-				log.Error(err, "Failed to push gcomm URI", "pod", node)
-				// A failed injection likely means the pod's status has changed.
-				// drop it from status and reprobe it in another reconcile loop
-				clearPodAttributes(instance, node)
-				return ctrl.Result{}, err
+			if pod == nil {
+				log.Info("Bootstrap candidate pod not found in pod list, will retry", "pod", node)
+				// Pod might be restarting, will be picked up in next reconcile
+			} else {
+				log.Info("Pushing gcomm URI to bootstrap", "pod", node)
+				// Setting the gcomm attribute marks this pod as 'currently bootstrapping the cluster'
+				err := injectGcommURI(ctx, helper, r.config, instance, pod, "gcomm://")
+				if err != nil {
+					log.Error(err, "Failed to push gcomm URI", "pod", node)
+					// A failed injection likely means the pod's status has changed.
+					// Clear runtime state but preserve seqno to prevent data loss on retry
+					clearPodRuntimeState(instance, node)
+					return ctrl.Result{}, err
+				}
 			}
 		}
 	}

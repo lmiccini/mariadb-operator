@@ -205,7 +205,9 @@ case "$1" in
         ;;
     readiness)
         # If the node is e.g. a donor, it cannot serve traffic
-        check_mysql_status wsrep_local_state_comment Synced
+        # Allow Syncing state to avoid marking pods not ready during IST
+        comment=$(get_mysql_status wsrep_local_state_comment)
+        test "${comment}" = "Synced" -o "${comment}" = "Syncing"
         ;;
     liveness)
         # If the node is not in the primary partition, the failed liveness probe
