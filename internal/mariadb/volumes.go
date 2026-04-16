@@ -241,6 +241,21 @@ func getGaleraInitVolumeMounts(g *mariadbv1.Galera) []corev1.VolumeMount {
 		volumeMounts = append(volumeMounts, getGaleraLogMount())
 	}
 
+	if g.Spec.TLS.Enabled() {
+		svc := tls.Service{
+			SecretName: *g.Spec.TLS.SecretName,
+			CertMount:  nil,
+			KeyMount:   nil,
+			CaMount:    nil,
+		}
+		serviceVolumeMounts := svc.CreateVolumeMounts(GaleraCertPrefix)
+		volumeMounts = append(volumeMounts, serviceVolumeMounts...)
+		if g.Spec.TLS.CaBundleSecretName != "" {
+			caVolumeMounts := g.Spec.TLS.CreateVolumeMounts(nil)
+			volumeMounts = append(volumeMounts, caVolumeMounts...)
+		}
+	}
+
 	return volumeMounts
 }
 
