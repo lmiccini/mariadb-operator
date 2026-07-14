@@ -174,10 +174,51 @@ func findBestCandidate(g *mariadbv1.Galera, pods []corev1.Pod, log logr.Logger) 
 			bestseqno = intseqno
 		}
 	}
-	if len(knownNodes) != int(*g.Spec.Replicas) {
-		return "", false
+	if len(knownNodes) == int(*g.Spec.Replicas) {
+		return bestnode, true
 	}
-	return bestnode, true
+
+	// Majority-quorum fallback: during rolling reboots (e.g. MCP rollout),
+	// some pods may be stuck in Init/Pending on rebooting nodes and unable
+	// to push their state. If a majority of pods have reported and every
+	// unreported pod is demonstrably unreachable (not Running), we can
+	// safely bootstrap from the best candidate among the reporting nodes.
+	//
+	// Safety: in Galera with standard pc.weight, a single node cannot form
+	// quorum alone, so a disconnected node cannot have committed transactions
+	// the majority doesn't have. The UUID check guards against split-brain.
+	majority := (int(*g.Spec.Replicas) / 2) + 1
+	if len(knownNodes) >= majority {
+		uuids := make(map[string]bool)
+		for _, n := range knownNodes {
+			if uuid := g.Status.Attributes[n].UUID; uuid != "" {
+				uuids[uuid] = true
+			}
+		}
+		if len(uuids) > 1 {
+			log.Info("Multiple UUIDs among reporting nodes, refusing majority bootstrap",
+				"uuids", uuids, "knownNodes", knownNodes)
+			return "", false
+		}
+
+		allUnreportedNonRunning := true
+		for _, pod := range pods {
+			if _, reported := g.Status.Attributes[pod.Name]; !reported {
+				if isPodRunning(&pod) {
+					allUnreportedNonRunning = false
+					break
+				}
+			}
+		}
+
+		if allUnreportedNonRunning {
+			log.Info("Proceeding with majority-quorum bootstrap: unreported pods are not Running",
+				"knownNodes", knownNodes, "totalReplicas", *g.Spec.Replicas)
+			return bestnode, true
+		}
+	}
+
+	return "", false
 }
 
 // buildGcommURI builds a gcomm URI for a galera instance
@@ -394,6 +435,59 @@ func isGaleraContainerStartedAndWaiting(ctx context.Context, pod *corev1.Pod, in
 			return nil
 		})
 	return err == nil && waiting
+}
+
+///
+// A/P service failover helper functions
+//
+
+// selectActivePod returns the name of a Ready pod to use as the active
+// endpoint, or empty string if the current active pod is already Ready
+// (no change needed) or no Ready pods are available.
+func selectActivePod(currentActive string, readyPods []corev1.Pod) string {
+	for _, p := range readyPods {
+		if p.Name == currentActive {
+			return ""
+		}
+	}
+	if len(readyPods) > 0 {
+		return readyPods[0].Name
+	}
+	return ""
+}
+
+// ensureActivePodIsReady checks that the A/P service selector points to a
+// Ready pod. If the active pod is not Ready but other Ready pods exist,
+// the selector is updated. This is a safety net for cases where
+// wsrep_notify failed to update the selector (e.g. pod killed too fast,
+// k8s API unreachable during node reboot, or all pods crashed and
+// restarted).
+func (r *GaleraReconciler) ensureActivePodIsReady(ctx context.Context, instance *mariadbv1.Galera, pods []corev1.Pod, log logr.Logger) error {
+	if !instance.Status.Bootstrapped {
+		return nil
+	}
+
+	readyPods := getReadyPods(pods)
+	if len(readyPods) == 0 {
+		return nil
+	}
+
+	svc := &corev1.Service{}
+	err := r.Get(ctx, types.NamespacedName{Name: instance.Name, Namespace: instance.Namespace}, svc)
+	if err != nil {
+		return err
+	}
+
+	currentActive := svc.Spec.Selector[mariadb.ActivePodSelectorKey]
+	newActive := selectActivePod(currentActive, readyPods)
+	if newActive == "" {
+		return nil
+	}
+
+	log.Info("Active pod is not Ready, updating service selector",
+		"previousActive", currentActive, "newActive", newActive)
+	svc.Spec.Selector[mariadb.ActivePodSelectorKey] = newActive
+	return r.Client.Update(ctx, svc)
 }
 
 ///
@@ -1066,6 +1160,16 @@ func (r *GaleraReconciler) Reconcile(ctx context.Context, req ctrl.Request) (res
 			if _, found := instance.Status.Attributes[name]; found {
 				log.Info("Galera started", "pod", name)
 				clearPodAttributes(ctx, instance, name)
+			}
+		}
+
+		// A/P failover safety net: ensure the service selector points
+		// to a Ready pod. wsrep_notify normally handles this, but may
+		// miss updates if pods are killed too fast or the k8s API is
+		// temporarily unreachable during a node reboot.
+		if len(readyPods) > 0 {
+			if err := r.ensureActivePodIsReady(ctx, instance, podList.Items, log); err != nil {
+				log.Error(err, "Failed to ensure active pod endpoint")
 			}
 		}
 

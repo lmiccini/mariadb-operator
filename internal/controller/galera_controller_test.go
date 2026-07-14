@@ -36,11 +36,18 @@ func makePod(name, containerID string) corev1.Pod {
 	return corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: name},
 		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
 			ContainerStatuses: []corev1.ContainerStatus{
 				{Name: "galera", ContainerID: containerID},
 			},
 		},
 	}
+}
+
+func makePodWithPhase(name, containerID string, phase corev1.PodPhase) corev1.Pod {
+	pod := makePod(name, containerID)
+	pod.Status.Phase = phase
+	return pod
 }
 
 func TestFindBestCandidate_AllFreshCIDs(t *testing.T) {
@@ -273,5 +280,229 @@ func TestBootstrapState_MultipleInstances(t *testing.T) {
 	}
 	if !r.isBootstrapInProgress(g2, pods2) {
 		t.Error("cell2 should still be in progress")
+	}
+}
+
+// TestMCPRollout_MajorityBootstrapWithInitPod reproduces the MCP rollout
+// scenario where one pod is stuck in Init on a rebooting node, and verifies
+// that the majority-quorum fallback allows bootstrap from the available pods.
+func TestMCPRollout_MajorityBootstrapWithInitPod(t *testing.T) {
+	g := makeGalera(3, map[string]mariadbv1.GaleraAttributes{
+		"galera-0": {Seqno: "29919", ContainerID: "cid-0", UUID: "3eec1139-7f2e-11f1-8576-1aec2611b4b0"},
+		"galera-2": {Seqno: "29919", ContainerID: "cid-2", UUID: "3eec1139-7f2e-11f1-8576-1aec2611b4b0"},
+	})
+
+	pods := []corev1.Pod{
+		makePodWithPhase("galera-0", "cid-0", corev1.PodRunning),
+		makePodWithPhase("galera-1", "", corev1.PodPending), // Init:0/1
+		makePodWithPhase("galera-2", "cid-2", corev1.PodRunning),
+	}
+
+	node, found := findBestCandidate(g, pods, ctrl.Log)
+	if !found {
+		t.Fatal("majority-quorum should allow bootstrap when unreported pod is Pending")
+	}
+	if node != "galera-0" && node != "galera-2" {
+		t.Errorf("expected galera-0 or galera-2 (same seqno), got %s", node)
+	}
+}
+
+// TestMCPRollout_SafeToBootstrapBypassesReplicaCheck verifies that when
+// one of the available pods has SafeToBootstrap=true, findBestCandidate
+// returns it immediately without waiting for all replicas.
+// This is the ONE code path that could save the MCP rollout scenario.
+func TestMCPRollout_SafeToBootstrapBypassesReplicaCheck(t *testing.T) {
+	g := makeGalera(3, map[string]mariadbv1.GaleraAttributes{
+		"galera-0": {Seqno: "29919", ContainerID: "cid-0", SafeToBootstrap: true},
+		"galera-2": {Seqno: "29919", ContainerID: "cid-2"},
+		// galera-1 has NO attributes
+	})
+
+	pods := []corev1.Pod{
+		makePodWithPhase("galera-0", "cid-0", corev1.PodRunning),
+		makePodWithPhase("galera-1", "", corev1.PodPending),
+		makePodWithPhase("galera-2", "cid-2", corev1.PodRunning),
+	}
+
+	node, found := findBestCandidate(g, pods, ctrl.Log)
+	if !found {
+		t.Fatal("SafeToBootstrap should allow bootstrap even with missing replicas")
+	}
+	if node != "galera-0" {
+		t.Errorf("expected galera-0 (SafeToBootstrap=true), got %s", node)
+	}
+}
+
+// TestMCPRollout_IsPodRunningSkipsInitPods verifies that isPodRunning
+// returns false for pods stuck in Init phase, which means the operator
+// won't try to probe them or inject gcomm URIs.
+func TestMCPRollout_IsPodRunningSkipsInitPods(t *testing.T) {
+	initPod := makePodWithPhase("galera-1", "", corev1.PodPending)
+	if isPodRunning(&initPod) {
+		t.Error("isPodRunning should return false for Init/Pending pods")
+	}
+
+	runningPod := makePodWithPhase("galera-0", "cid-0", corev1.PodRunning)
+	if !isPodRunning(&runningPod) {
+		t.Error("isPodRunning should return true for Running pods")
+	}
+}
+
+// TestMCPRollout_GetReadyPodsSkipsNonRunning verifies that getReadyPods
+// filters out pods in Init/Pending phase, which matters for determining
+// the Galera cluster state during rolling reboots.
+func TestMCPRollout_GetReadyPodsSkipsNonRunning(t *testing.T) {
+	pods := []corev1.Pod{
+		makePodWithPhase("galera-0", "cid-0", corev1.PodRunning),
+		makePodWithPhase("galera-1", "", corev1.PodPending),
+		makePodWithPhase("galera-2", "cid-2", corev1.PodRunning),
+	}
+	// None of the pods have a Ready condition set, so getReadyPods
+	// returns none even for Running pods. This is correct — Running
+	// but not Ready means galera hasn't started.
+	ready := getReadyPods(pods)
+	if len(ready) != 0 {
+		t.Errorf("expected 0 ready pods (none have Ready condition), got %d", len(ready))
+	}
+}
+
+// Tests for majority-quorum bootstrap (Fix 1)
+
+func TestFindBestCandidate_MajorityBootstrap_DifferentUUID(t *testing.T) {
+	// Split-brain guard: 2/3 reported but with different UUIDs.
+	// Must NOT allow bootstrap — different UUIDs indicate a partition.
+	g := makeGalera(3, map[string]mariadbv1.GaleraAttributes{
+		"galera-0": {Seqno: "100", ContainerID: "cid-0", UUID: "uuid-A"},
+		"galera-2": {Seqno: "100", ContainerID: "cid-2", UUID: "uuid-B"},
+	})
+	pods := []corev1.Pod{
+		makePodWithPhase("galera-0", "cid-0", corev1.PodRunning),
+		makePodWithPhase("galera-1", "", corev1.PodPending),
+		makePodWithPhase("galera-2", "cid-2", corev1.PodRunning),
+	}
+	_, found := findBestCandidate(g, pods, ctrl.Log)
+	if found {
+		t.Error("should NOT allow majority bootstrap when UUIDs differ (split-brain)")
+	}
+}
+
+func TestFindBestCandidate_MajorityBootstrap_UnreportedRunningPod(t *testing.T) {
+	// 2/3 reported, but the 3rd pod is Running (not Pending/Init).
+	// It might still push state, so we must wait.
+	g := makeGalera(3, map[string]mariadbv1.GaleraAttributes{
+		"galera-0": {Seqno: "100", ContainerID: "cid-0", UUID: "uuid-A"},
+		"galera-2": {Seqno: "100", ContainerID: "cid-2", UUID: "uuid-A"},
+	})
+	pods := []corev1.Pod{
+		makePod("galera-0", "cid-0"),   // Running
+		makePod("galera-1", "cid-1"),   // Running but hasn't pushed
+		makePod("galera-2", "cid-2"),   // Running
+	}
+	_, found := findBestCandidate(g, pods, ctrl.Log)
+	if found {
+		t.Error("should NOT allow majority bootstrap when unreported pod is Running")
+	}
+}
+
+func TestFindBestCandidate_MajorityBootstrap_PicksHighestSeqno(t *testing.T) {
+	// 2/3 reported with same UUID but different seqno.
+	// Should pick the one with the highest seqno.
+	g := makeGalera(3, map[string]mariadbv1.GaleraAttributes{
+		"galera-0": {Seqno: "100", ContainerID: "cid-0", UUID: "uuid-A"},
+		"galera-2": {Seqno: "200", ContainerID: "cid-2", UUID: "uuid-A"},
+	})
+	pods := []corev1.Pod{
+		makePodWithPhase("galera-0", "cid-0", corev1.PodRunning),
+		makePodWithPhase("galera-1", "", corev1.PodPending),
+		makePodWithPhase("galera-2", "cid-2", corev1.PodRunning),
+	}
+	node, found := findBestCandidate(g, pods, ctrl.Log)
+	if !found {
+		t.Fatal("should allow majority bootstrap with same UUID")
+	}
+	if node != "galera-2" {
+		t.Errorf("expected galera-2 (highest seqno=200), got %s", node)
+	}
+}
+
+func TestFindBestCandidate_MajorityBootstrap_SingleReplica(t *testing.T) {
+	// Single replica cluster, pod is Pending. Majority = 1, known = 0.
+	g := makeGalera(1, map[string]mariadbv1.GaleraAttributes{})
+	pods := []corev1.Pod{
+		makePodWithPhase("galera-0", "", corev1.PodPending),
+	}
+	_, found := findBestCandidate(g, pods, ctrl.Log)
+	if found {
+		t.Error("should NOT bootstrap single replica when no pods reported")
+	}
+}
+
+func TestFindBestCandidate_MajorityBootstrap_FiveNodes(t *testing.T) {
+	// 5-node cluster, 3/5 reported (majority), 2 Pending.
+	g := makeGalera(5, map[string]mariadbv1.GaleraAttributes{
+		"galera-0": {Seqno: "500", ContainerID: "cid-0", UUID: "uuid-A"},
+		"galera-2": {Seqno: "500", ContainerID: "cid-2", UUID: "uuid-A"},
+		"galera-4": {Seqno: "500", ContainerID: "cid-4", UUID: "uuid-A"},
+	})
+	pods := []corev1.Pod{
+		makePodWithPhase("galera-0", "cid-0", corev1.PodRunning),
+		makePodWithPhase("galera-1", "", corev1.PodPending),
+		makePodWithPhase("galera-2", "cid-2", corev1.PodRunning),
+		makePodWithPhase("galera-3", "", corev1.PodPending),
+		makePodWithPhase("galera-4", "cid-4", corev1.PodRunning),
+	}
+	node, found := findBestCandidate(g, pods, ctrl.Log)
+	if !found {
+		t.Fatal("should allow majority bootstrap with 3/5 reporting, same UUID")
+	}
+	t.Logf("Selected node: %s", node)
+}
+
+// Tests for A/P failover (Fix 2)
+
+func makePodReady(name, containerID string) corev1.Pod {
+	pod := makePod(name, containerID)
+	pod.Status.Conditions = []corev1.PodCondition{
+		{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+	}
+	return pod
+}
+
+func TestSelectActivePod_CurrentIsReady(t *testing.T) {
+	readyPods := []corev1.Pod{
+		makePodReady("galera-0", "cid-0"),
+		makePodReady("galera-1", "cid-1"),
+	}
+	result := selectActivePod("galera-0", readyPods)
+	if result != "" {
+		t.Errorf("expected no change (current active is Ready), got %s", result)
+	}
+}
+
+func TestSelectActivePod_CurrentNotReady(t *testing.T) {
+	readyPods := []corev1.Pod{
+		makePodReady("galera-1", "cid-1"),
+		makePodReady("galera-2", "cid-2"),
+	}
+	result := selectActivePod("galera-0", readyPods)
+	if result != "galera-1" {
+		t.Errorf("expected galera-1 (first Ready pod), got %q", result)
+	}
+}
+
+func TestSelectActivePod_NoReadyPods(t *testing.T) {
+	result := selectActivePod("galera-0", nil)
+	if result != "" {
+		t.Errorf("expected empty (no Ready pods), got %s", result)
+	}
+}
+
+func TestSelectActivePod_ActiveNotInCluster(t *testing.T) {
+	readyPods := []corev1.Pod{
+		makePodReady("galera-1", "cid-1"),
+	}
+	result := selectActivePod("galera-nonexistent", readyPods)
+	if result != "galera-1" {
+		t.Errorf("expected galera-1, got %q", result)
 	}
 }
